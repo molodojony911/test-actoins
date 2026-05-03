@@ -1,0 +1,89 @@
+# Сборка Docker-образа → GitHub Container Registry (GHCR), затем деплой по SSH.
+#
+# Секреты репозитория (Settings → Secrets and variables → Actions):
+#   SSH_HOST           — хост сервера (IP или домен)
+#   SSH_USER           — пользователь SSH
+#   SSH_PRIVATE_KEY    — приватный ключ (весь PEM, с BEGIN/END)
+#   (при SSH не на порту 22 добавьте в шаг appleboy параметр port: ${{ secrets.SSH_PORT }})
+#   GHCR_USERNAME      — логин GitHub для docker login на сервере (часто тот же, что владелец PAT)
+#   GHCR_PULL_TOKEN    — PAT с правом read:packages (и при приватном образе — read на репозиторий пакета)
+#
+# Пакет GHCR должен быть доступен этому пользователю (public пакет или выдан доступ).
+
+name: Build, push to GHCR, deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Имя контейнера на сервере и порт приложения (как в Dockerfile)
+  DEPLOY_CONTAINER_NAME: test-gitact
+  APP_PORT: "8000"
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.lowercase }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase image name (GHCR)
+        id: image
+        run: |
+          echo "lowercase=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.lowercase }}:latest
+            ${{ steps.image.outputs.lowercase }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy over SSH
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Run remote deploy
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}:latest
+          GHCR_USER: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          CONTAINER_NAME: ${{ env.DEPLOY_CONTAINER_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN,CONTAINER_NAME,APP_PORT
+          script: |
+            set -e
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$IMAGE"
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "$APP_PORT:$APP_PORT" \
+              "$IMAGE"
