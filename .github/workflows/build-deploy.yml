@@ -65,25 +65,18 @@ jobs:
     steps:
       - name: Run remote deploy
         uses: appleboy/ssh-action@v1.2.0
-        env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}:latest
-          GHCR_USER: ${{ secrets.GHCR_USERNAME }}
-          GHCR_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          CONTAINER_NAME: ${{ env.DEPLOY_CONTAINER_NAME }}
-          APP_PORT: ${{ env.APP_PORT }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE,GHCR_USER,GHCR_TOKEN,CONTAINER_NAME,APP_PORT
           script: |
             set -e
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            docker pull "$IMAGE"
-            docker stop "$CONTAINER_NAME" 2>/dev/null || true
-            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+            docker pull "${{ needs.build-and-push.outputs.image }}:latest"
+            docker stop "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
+            docker rm "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
             docker run -d \
-              --name "$CONTAINER_NAME" \
+              --name "${{ env.DEPLOY_CONTAINER_NAME }}" \
               --restart unless-stopped \
-              -p "$APP_PORT:$APP_PORT" \
-              "$IMAGE"
+              -p "${{ env.APP_PORT }}:${{ env.APP_PORT }}" \
+              "${{ needs.build-and-push.outputs.image }}:latest"
