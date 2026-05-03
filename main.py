@@ -5,6 +5,83 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Test Backend", version="0.1.0")
 
+# (IANA, подсказки для поиска — город или вариант написания)
+_ZONE_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("Europe/Moscow", ("москва", "moscow", "санкт-петербург", "спб", "питер", "saint petersburg")),
+    ("Europe/Kaliningrad", ("калининград", "kaliningrad")),
+    ("Europe/Samara", ("самара", "samara")),
+    ("Asia/Yekaterinburg", ("екатеринбург", "yekaterinburg")),
+    ("Asia/Omsk", ("омск", "omsk")),
+    ("Asia/Krasnoyarsk", ("красноярск", "krasnoyarsk")),
+    ("Asia/Irkutsk", ("иркутск", "irkutsk")),
+    ("Asia/Yakutsk", ("якутск", "yakutsk")),
+    ("Asia/Vladivostok", ("владивосток", "vladivostok")),
+    ("Europe/Kyiv", ("киев", "kyiv", "kiev")),
+    ("Europe/Minsk", ("минск", "minsk")),
+    ("Europe/Warsaw", ("варшава", "warsaw")),
+    ("Europe/Berlin", ("берлин", "berlin")),
+    ("Europe/Paris", ("париж", "paris")),
+    ("Europe/London", ("лондон", "london")),
+    ("America/New_York", ("нью-йорк", "new york", "нью йорк")),
+    ("America/Chicago", ("чикаго", "chicago")),
+    ("America/Denver", ("денвер", "denver")),
+    ("America/Los_Angeles", ("лос-анджелес", "los angeles")),
+    ("Asia/Dubai", ("дубай", "dubai")),
+    ("Asia/Almaty", ("алматы", "almaty", "астана", "astana")),
+    ("Asia/Tokyo", ("токио", "tokyo")),
+    ("Asia/Seoul", ("сеул", "seoul")),
+    ("Asia/Shanghai", ("шанхай", "shanghai")),
+    ("Asia/Beijing", ("пекин", "beijing")),
+    ("Asia/Hong_Kong", ("гонконг", "hong kong")),
+    ("Australia/Sydney", ("сидней", "sydney")),
+    ("Pacific/Auckland", ("окленд", "auckland")),
+    ("UTC", ("utc", "всемирное", "гринвич", "greenwich")),
+]
+
+_CITY_TO_IANA: dict[str, str] = {}
+for iana, hints in _ZONE_HINTS:
+    for h in hints:
+        _CITY_TO_IANA[h.casefold()] = iana
+
+
+def _resolve_timezone(user_input: str) -> str:
+    key = user_input.strip().casefold()
+    if key in _CITY_TO_IANA:
+        return _CITY_TO_IANA[key]
+    try:
+        ZoneInfo(user_input.strip())
+    except ZoneInfoNotFoundError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Не удалось понять город или пояс «{user_input}». "
+                "Откройте GET /time/cities — там список городов и точных имён поясов (IANA)."
+            ),
+        )
+    return user_input.strip()
+
+
+def _parse_local_clock(time_str: str, from_tz: ZoneInfo) -> datetime:
+    raw = time_str.strip()
+    now = datetime.now(from_tz)
+    formats: tuple[tuple[str, bool], ...] = (
+        ("%Y-%m-%d %H:%M", False),
+        ("%d.%m.%Y %H:%M", False),
+        ("%H:%M", True),
+    )
+    for fmt, today_only in formats:
+        try:
+            dt = datetime.strptime(raw, fmt)
+            if today_only:
+                dt = dt.replace(year=now.year, month=now.month, day=now.day)
+            return dt.replace(tzinfo=from_tz)
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=400,
+        detail="Время: укажите как ЧЧ:ММ (сегодня у вас в городе) или 2026-05-03 14:30 или 03.05.2026 14:30",
+    )
+
 
 @app.get("/time")
 def get_server_time() -> dict[str, str]:
@@ -24,50 +101,64 @@ def get_server_date_utc() -> dict[str, str]:
     return {"server_date_utc": datetime.now(timezone.utc).date().isoformat()}
 
 
+def _zone_label(hints: tuple[str, ...]) -> str:
+    for h in hints:
+        if any("\u0400" <= c <= "\u04ff" for c in h):
+            return h.capitalize()
+    h0 = hints[0]
+    if h0.casefold() == "utc":
+        return "UTC"
+    return h0.replace("_", " ").title()
+
+
+@app.get("/time/cities")
+def list_time_cities() -> dict[str, list[dict[str, str]]]:
+    """Города и пояса для подсказок в форме (можно искать по городу или вставить IANA)."""
+    items: list[dict[str, str]] = []
+    for iana, hints in _ZONE_HINTS:
+        items.append(
+            {
+                "label": _zone_label(hints),
+                "zone": iana,
+                "examples": ", ".join(sorted(set(hints), key=str.lower)),
+            }
+        )
+    return {"cities": items}
+
+
 @app.get("/time/convert")
-def convert_time_to_zone(
-    to_zone: str = Query(
+def convert_local_time_to_zone(
+    time: str = Query(
         ...,
-        alias="to",
-        description="Часовой пояс IANA, например Europe/Moscow или America/New_York",
+        description="Ваши часы: 14:30 (сегодня) или 2026-05-03 14:30 или 03.05.2026 14:30",
     ),
-    at: str | None = Query(
-        None,
-        description=(
-            "Момент времени в ISO 8601 с указанием зоны (Z или ±смещение). "
-            "Если не задан — используется текущий момент по UTC."
-        ),
+    from_city: str = Query(
+        ...,
+        description="Город, где вы сейчас (например Москва, London) или IANA вроде Europe/Moscow",
+    ),
+    to: str = Query(
+        ...,
+        description="Куда перевести: город (Токио) или пояс IANA (Asia/Tokyo)",
     ),
 ) -> dict[str, str]:
-    """Переводит момент времени в выбранный часовой пояс."""
-    try:
-        target_tz = ZoneInfo(to_zone)
-    except ZoneInfoNotFoundError:
-        raise HTTPException(status_code=400, detail=f"Неизвестный часовой пояс: {to_zone}")
+    """Сколько времени в другом городе/поясе, если у вас на часах указано время в вашем городе."""
+    from_iana = _resolve_timezone(from_city)
+    to_iana = _resolve_timezone(to)
+    from_tz = ZoneInfo(from_iana)
+    to_tz = ZoneInfo(to_iana)
 
-    if at is not None:
-        s = at.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            instant = datetime.fromisoformat(s)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Некорректная дата/время ISO 8601")
-        if instant.tzinfo is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Укажите зону в строке времени (например Z или +03:00)",
-            )
-    else:
-        instant = datetime.now(timezone.utc)
-
-    utc = instant.astimezone(timezone.utc)
-    local = instant.astimezone(target_tz)
+    instant = _parse_local_clock(time, from_tz)
+    there = instant.astimezone(to_tz)
 
     return {
-        "to_zone": to_zone,
-        "input_utc": utc.isoformat(),
-        "local_time": local.isoformat(),
+        "your_input": time.strip(),
+        "your_city_or_zone": from_city.strip(),
+        "your_timezone": from_iana,
+        "your_time_local": instant.isoformat(),
+        "target_city_or_zone": to.strip(),
+        "target_timezone": to_iana,
+        "time_there": there.isoformat(),
+        "time_there_clock": there.strftime("%H:%M, %d.%m.%Y"),
     }
 
 
