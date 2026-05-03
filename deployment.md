@@ -16,18 +16,20 @@
 - Порт **SSH** по умолчанию **22**. Для другого порта в workflow в шаг `appleboy/ssh-action` нужно добавить параметр `port: ${{ secrets.SSH_PORT }}` и завести секрет `SSH_PORT`.
 - На сервере должен быть свободен порт приложения (см. ниже `APP_PORT`, по умолчанию **8000**).
 
-## Секреты репозитория
+## Секреты и переменные репозитория
 
 Настройка: **Settings** → **Secrets and variables** → **Actions**.
 
-| Секрет | Обязательно | Назначение |
-|--------|-------------|------------|
-| `SSH_HOST` | да | Хост сервера (IP или домен). |
-| `SSH_USER` | да | Пользователь для SSH. |
-| `SSH_PRIVATE_KEY` | да | Приватный ключ целиком (PEM, строки `BEGIN` / `END`). |
-| `GHCR_USERNAME` | да | Логин для `docker login ghcr.io` на сервере (обычно GitHub username владельца PAT). |
-| `GHCR_PULL_TOKEN` | да | Personal Access Token с правом **`read:packages`**. Для приватного пакета в GHCR может понадобиться расширенный доступ к репозиторию пакета. |
-| `SSH_PORT` | нет | Только если SSH не на порту 22 и вы добавили `port` в workflow. |
+**Важно:** workflow должен быть **закоммичен и запушен** в ту ветку, откуда он запускается (у вас — `main`). Если в логе у шага `Run remote deploy` в блоке `with:` указано **`key:`**, а не **`key_path:`**, на GitHub всё ещё **старая** версия файла — подтяните актуальный `.github/workflows/build-deploy.yml`.
+
+| Имя | Тип | Обязательно | Назначение |
+|-----|-----|-------------|------------|
+| `SSH_HOST` | Secret **или** Variable | да | Хост сервера (IP или домен). В workflow: сначала Variable `SSH_HOST`, иначе Secret. |
+| `SSH_USER` | **Variable (рекомендуется)** или Secret | да | Пользователь SSH (`ubuntu`, `root`, …). Имя пользователя не секрет: задайте **Repository variable** `SSH_USER` — так проще отладить «username is empty». Если используете только Secret, имя должно быть в точности **`SSH_USER`**. |
+| `SSH_PRIVATE_KEY` | Secret | да | Приватный ключ целиком (PEM, строки `BEGIN` / `END`). |
+| `GHCR_USERNAME` | Secret | да | Логин для `docker login ghcr.io` на сервере (обычно GitHub username владельца PAT). |
+| `GHCR_PULL_TOKEN` | Secret | да | Personal Access Token с правом **`read:packages`**. Для приватного пакета в GHCR может понадобиться расширенный доступ к репозиторию пакета. |
+| `SSH_PORT` | Secret | нет | Только если SSH не на порту 22 и вы добавили `port` в workflow. |
 
 Секреты не коммитить в репозиторий; хранить только в GitHub Secrets.
 

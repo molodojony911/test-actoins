@@ -1,8 +1,8 @@
 # Сборка Docker-образа → GitHub Container Registry (GHCR), затем деплой по SSH.
 #
-# Секреты репозитория (Settings → Secrets and variables → Actions):
-#   SSH_HOST           — хост сервера (IP или домен)
-#   SSH_USER           — пользователь SSH
+# Секреты и переменные (Settings → Secrets and variables → Actions):
+#   SSH_HOST           — хост (секрет или Variables → SSH_HOST)
+#   SSH_USER           — пользователь SSH: надёжнее задать как Variable (не секрет), см. шаг ниже
 #   SSH_PRIVATE_KEY    — приватный ключ (весь PEM, с BEGIN/END)
 #   (при SSH не на порту 22 добавьте в шаг appleboy параметр port: ${{ secrets.SSH_PORT }})
 #   GHCR_USERNAME      — логин GitHub для docker login на сервере (часто тот же, что владелец PAT)
@@ -63,6 +63,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-push
     steps:
+      # Имя пользователя SSH: GitHub Variables (SSH_USER) подставляются явно; секрет SSH_USER — запасной вариант.
+      # Если drone-ssh пишет "username is empty", в этом репозитории нет Variable/Secret с непустым значением.
+      - name: Check deploy credentials
+        env:
+          SSH_HOST_VAL: ${{ vars.SSH_HOST || secrets.SSH_HOST }}
+          SSH_USER_VAL: ${{ vars.SSH_USER || secrets.SSH_USER }}
+          GHCR_USER_VAL: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN_VAL: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          missing=0
+          if [ -z "${SSH_HOST_VAL}" ]; then echo "::error::Не задан SSH_HOST (Variable или Secret)"; missing=1; fi
+          if [ -z "${SSH_USER_VAL}" ]; then echo "::error::Не задан SSH_USER (рекомендуется Variable: Settings → Variables → SSH_USER)"; missing=1; fi
+          if [ -z "${GHCR_USER_VAL}" ]; then echo "::error::Не задан Secret GHCR_USERNAME"; missing=1; fi
+          if [ -z "${GHCR_TOKEN_VAL}" ]; then echo "::error::Не задан Secret GHCR_PULL_TOKEN"; missing=1; fi
+          exit "$missing"
+
       # Ключ через файл: многострочный PEM в секрете не «схлопывается», как иногда бывает с key: в YAML.
       - name: Write SSH private key
         run: |
@@ -74,8 +90,8 @@ jobs:
       - name: Run remote deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
+          host: ${{ vars.SSH_HOST || secrets.SSH_HOST }}
+          username: ${{ vars.SSH_USER || secrets.SSH_USER }}
           key_path: ${{ runner.temp }}/gha_deploy_key
           script: |
             set -e
