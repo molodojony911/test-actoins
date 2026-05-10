@@ -1,9 +1,38 @@
+import logging
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
-app = FastAPI(title="Test Backend", version="0.1.0")
+from logging_loki import setup_logging
+
+logger = logging.getLogger("app")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    yield
+
+
+app = FastAPI(title="Test Backend", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        "%s %s -> %s %.1fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 # (IANA, подсказки для поиска — город или вариант написания)
 _ZONE_HINTS: list[tuple[str, tuple[str, ...]]] = [
