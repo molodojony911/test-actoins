@@ -8,15 +8,13 @@
 #   GHCR_USERNAME      — логин GitHub для docker login на сервере (часто тот же, что владелец PAT)
 #   GHCR_PULL_TOKEN    — PAT с правом read:packages (и при приватном образе — read на репозиторий пакета)
 #
-# Логи в Loki (передаются в docker run на сервере):
-#   Variables: LOKI_URL — URL push API для контейнера приложения. Типично:
-#             • Loki слушает порт на СЕРВЕРЕ (docker -p 3100:3100 или бинарь на хосте):
-#               LOKI_URL=http://host.docker.internal:3100
-#               (в скрипте добавлен --add-host=host.docker.internal:host-gateway — Linux Docker 20.10+)
-#             • Loki в той же Docker-сети, что и приложение: Variable DEPLOY_DOCKER_NETWORK = имя сети
-#               (см. docker network ls), LOKI_URL=http://<имя_контейнера_loki>:3100
-#             Опционально: LOKI_APP_LABEL, LOKI_ENV
-#   Secrets (опц.): LOKI_ORG_ID, LOKI_BASIC_AUTH_USER, LOKI_BASIC_AUTH_PASSWORD
+# Логи в Loki (docker run):
+#   LOKI_URL по умолчанию http://loki:3100 (env ниже; переопределение: Variable LOKI_URL).
+#   Контейнер подключается к сети loki-monitoring (env DEPLOY_DOCKER_NETWORK), как у external network в compose.
+#   На сервере сеть должна существовать: docker network create loki-monitoring
+#   или та же name, что у стека с Loki (иначе docker run упадёт).
+#   Другое имя сети: Variable DEPLOY_DOCKER_NETWORK в репозитории.
+#   Опционально: LOKI_APP_LABEL, LOKI_ENV. Secrets: LOKI_ORG_ID, LOKI_BASIC_AUTH_*.
 #
 # Пакет GHCR должен быть доступен этому пользователю (public пакет или выдан доступ).
 
@@ -36,6 +34,9 @@ env:
   # Имя контейнера на сервере и порт приложения (как в Dockerfile)
   DEPLOY_CONTAINER_NAME: test-gitact
   APP_PORT: "8000"
+  LOKI_URL: http://loki:3100
+  # Та же Docker-сеть, что у Loki (external: name: loki-monitoring в compose)
+  DEPLOY_DOCKER_NETWORK: loki-monitoring
 
 jobs:
   build-and-push:
@@ -111,17 +112,18 @@ jobs:
             docker pull "${{ needs.build-and-push.outputs.image }}:latest"
             docker stop "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
             docker rm "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
-            NET=""
-            if [ -n "${{ vars.DEPLOY_DOCKER_NETWORK }}" ]; then
-              NET="--network ${{ vars.DEPLOY_DOCKER_NETWORK }}"
+            NET_NAME="${{ vars.DEPLOY_DOCKER_NETWORK || env.DEPLOY_DOCKER_NETWORK }}"
+            NET_ARG=""
+            if [ -n "$NET_NAME" ]; then
+              NET_ARG="--network $NET_NAME"
             fi
             docker run -d \
               --name "${{ env.DEPLOY_CONTAINER_NAME }}" \
               --restart unless-stopped \
-              ${NET} \
+              $NET_ARG \
               --add-host=host.docker.internal:host-gateway \
               -p "${{ env.APP_PORT }}:${{ env.APP_PORT }}" \
-              -e LOKI_URL="${{ vars.LOKI_URL }}" \
+              -e LOKI_URL="${{ vars.LOKI_URL || env.LOKI_URL }}" \
               -e LOKI_APP_LABEL="${{ vars.LOKI_APP_LABEL }}" \
               -e LOKI_ENV="${{ vars.LOKI_ENV }}" \
               -e LOKI_ORG_ID="${{ secrets.LOKI_ORG_ID }}" \
