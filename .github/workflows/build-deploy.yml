@@ -9,8 +9,12 @@
 #   GHCR_PULL_TOKEN    — PAT с правом read:packages (и при приватном образе — read на репозиторий пакета)
 #
 # Логи в Loki (передаются в docker run на сервере):
-#   Variables: LOKI_URL — адрес Loki, куда контейнер достучится (не localhost хоста, если Loki в Docker-сети:
-#             например http://IP_СЕРВЕРА:3100 или имя контейнера/сервиса в общей сети).
+#   Variables: LOKI_URL — URL push API для контейнера приложения. Типично:
+#             • Loki слушает порт на СЕРВЕРЕ (docker -p 3100:3100 или бинарь на хосте):
+#               LOKI_URL=http://host.docker.internal:3100
+#               (в скрипте добавлен --add-host=host.docker.internal:host-gateway — Linux Docker 20.10+)
+#             • Loki в той же Docker-сети, что и приложение: Variable DEPLOY_DOCKER_NETWORK = имя сети
+#               (см. docker network ls), LOKI_URL=http://<имя_контейнера_loki>:3100
 #             Опционально: LOKI_APP_LABEL, LOKI_ENV
 #   Secrets (опц.): LOKI_ORG_ID, LOKI_BASIC_AUTH_USER, LOKI_BASIC_AUTH_PASSWORD
 #
@@ -99,15 +103,23 @@ jobs:
           host: ${{ vars.SSH_HOST || secrets.SSH_HOST }}
           username: ${{ vars.SSH_USER || secrets.SSH_USER }}
           key_path: ${{ runner.temp }}/gha_deploy_key
+          # По умолчанию 10m — часто не хватает на docker pull с GHCR при медленном канале.
+          command_timeout: 30m
           script: |
             set -e
             echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
             docker pull "${{ needs.build-and-push.outputs.image }}:latest"
             docker stop "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
             docker rm "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
+            NET=""
+            if [ -n "${{ vars.DEPLOY_DOCKER_NETWORK }}" ]; then
+              NET="--network ${{ vars.DEPLOY_DOCKER_NETWORK }}"
+            fi
             docker run -d \
               --name "${{ env.DEPLOY_CONTAINER_NAME }}" \
               --restart unless-stopped \
+              ${NET} \
+              --add-host=host.docker.internal:host-gateway \
               -p "${{ env.APP_PORT }}:${{ env.APP_PORT }}" \
               -e LOKI_URL="${{ vars.LOKI_URL }}" \
               -e LOKI_APP_LABEL="${{ vars.LOKI_APP_LABEL }}" \
