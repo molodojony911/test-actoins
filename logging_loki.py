@@ -79,8 +79,9 @@ def setup_logging() -> None:
         app_log.addHandler(stream)
 
     global _LOKI_ATTACHED
-    url = (os.environ.get("LOKI_URL") or "http://loki:3100").strip()
-    if not url or _LOKI_ATTACHED:
+    # Пустая / только пробелы — как не задано: тот же default, что и при unset.
+    url = (os.environ.get("LOKI_URL") or "").strip() or "http://loki:3100"
+    if _LOKI_ATTACHED:
         return
     _LOKI_ATTACHED = True
 
