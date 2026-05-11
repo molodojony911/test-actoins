@@ -1,92 +1,16 @@
-import base64
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from logging_loki import loki_static_labels_from_env, setup_logging
+from logging_loki import send_log_to_loki, setup_logging
 
 logger = logging.getLogger("app")
-
-
-def send_log_to_loki(
-    message: str,
-    *,
-    push_url: str | None = None,
-    stream_labels: dict[str, str] | None = None,
-    merge_with_defaults: bool = True,
-    level: str | None = "info",
-    timestamp_ns: int | None = None,
-    org_id: str | None = None,
-    basic_user: str | None = None,
-    basic_password: str | None = None,
-    basic_token: str | None = None,
-    timeout: float | None = None,
-) -> None:
-    """POST тела Loki push API: одна строка в ``streams[].values``.
-
-    Эндпоинт: ``{base}/loki/api/v1/push``. При ``merge_with_defaults=True``
-    к ``stream_labels`` добавляются лейблы из окружения (как у ``setup_logging``).
-    """
-    if push_url is None:
-        url = (os.environ.get("LOKI_URL") or "").strip() or "http://loki:3100"
-        base = url.rstrip("/").removesuffix("/loki/api/v1/push")
-        push_url = f"{base}/loki/api/v1/push"
-
-    if merge_with_defaults:
-        labels: dict[str, str] = {**loki_static_labels_from_env(), **(stream_labels or {})}
-        if level:
-            labels["level"] = level.lower()
-    else:
-        labels = dict(stream_labels or {})
-
-    if timestamp_ns is None:
-        timestamp_ns = int(time.time() * 1_000_000_000)
-
-    payload: dict[str, Any] = {
-        "streams": [
-            {
-                "stream": labels,
-                "values": [[str(timestamp_ns), message]],
-            }
-        ]
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = Request(
-        push_url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    if org_id is None:
-        org_id = (os.environ.get("LOKI_ORG_ID") or "").strip() or None
-    if org_id:
-        req.add_header("X-Scope-OrgID", org_id)
-
-    token = basic_token
-    if token is None and basic_user is not None and basic_password is not None:
-        raw = f"{basic_user}:{basic_password}".encode("utf-8")
-        token = base64.b64encode(raw).decode("ascii")
-    if token is None:
-        u = (os.environ.get("LOKI_BASIC_AUTH_USER") or "").strip() or None
-        p = (os.environ.get("LOKI_BASIC_AUTH_PASSWORD") or "").strip() or None
-        if u is not None and p is not None:
-            raw = f"{u}:{p}".encode("utf-8")
-            token = base64.b64encode(raw).decode("ascii")
-    if token:
-        req.add_header("Authorization", f"Basic {token}")
-
-    to = timeout if timeout is not None else float(os.environ.get("LOKI_TIMEOUT", "5"))
-    urlopen(req, timeout=to)
 
 
 def _detail_for_log(detail: object) -> str:
