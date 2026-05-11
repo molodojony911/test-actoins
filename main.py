@@ -1,15 +1,102 @@
+import base64
+import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from logging_loki import setup_logging
+from logging_loki import loki_static_labels_from_env, setup_logging
 
 logger = logging.getLogger("app")
+
+
+def send_log_to_loki(
+    message: str,
+    *,
+    push_url: str | None = None,
+    stream_labels: dict[str, str] | None = None,
+    merge_with_defaults: bool = True,
+    level: str | None = "info",
+    timestamp_ns: int | None = None,
+    org_id: str | None = None,
+    basic_user: str | None = None,
+    basic_password: str | None = None,
+    basic_token: str | None = None,
+    timeout: float | None = None,
+) -> None:
+    """POST тела Loki push API: одна строка в ``streams[].values``.
+
+    Эндпоинт: ``{base}/loki/api/v1/push``. При ``merge_with_defaults=True``
+    к ``stream_labels`` добавляются лейблы из окружения (как у ``setup_logging``).
+    """
+    if push_url is None:
+        url = (os.environ.get("LOKI_URL") or "").strip() or "http://loki:3100"
+        base = url.rstrip("/").removesuffix("/loki/api/v1/push")
+        push_url = f"{base}/loki/api/v1/push"
+
+    if merge_with_defaults:
+        labels: dict[str, str] = {**loki_static_labels_from_env(), **(stream_labels or {})}
+        if level:
+            labels["level"] = level.lower()
+    else:
+        labels = dict(stream_labels or {})
+
+    if timestamp_ns is None:
+        timestamp_ns = int(time.time() * 1_000_000_000)
+
+    payload: dict[str, Any] = {
+        "streams": [
+            {
+                "stream": labels,
+                "values": [[str(timestamp_ns), message]],
+            }
+        ]
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        push_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    if org_id is None:
+        org_id = (os.environ.get("LOKI_ORG_ID") or "").strip() or None
+    if org_id:
+        req.add_header("X-Scope-OrgID", org_id)
+
+    token = basic_token
+    if token is None and basic_user is not None and basic_password is not None:
+        raw = f"{basic_user}:{basic_password}".encode("utf-8")
+        token = base64.b64encode(raw).decode("ascii")
+    if token is None:
+        u = (os.environ.get("LOKI_BASIC_AUTH_USER") or "").strip() or None
+        p = (os.environ.get("LOKI_BASIC_AUTH_PASSWORD") or "").strip() or None
+        if u is not None and p is not None:
+            raw = f"{u}:{p}".encode("utf-8")
+            token = base64.b64encode(raw).decode("ascii")
+    if token:
+        req.add_header("Authorization", f"Basic {token}")
+
+    to = timeout if timeout is not None else float(os.environ.get("LOKI_TIMEOUT", "5"))
+    urlopen(req, timeout=to)
+
+
+def _detail_for_log(detail: object) -> str:
+    """Сериализация exc.detail для JSON-лога."""
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(detail)
 
 
 @asynccontextmanager
@@ -23,13 +110,15 @@ app = FastAPI(title="Test Backend", version="0.1.0", lifespan=lifespan)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    """4xx/5xx в Loki (logger app + uvicorn.error)."""
+    """4xx/5xx: структурированный JSON-лог в Loki."""
     logger.warning(
-        "ошибка %s %s: статус=%s деталь=%s",
-        request.method,
-        request.url.path,
-        exc.status_code,
-        exc.detail,
+        "ошибка запроса",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": exc.status_code,
+            "detail": _detail_for_log(exc.detail),
+        },
     )
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
@@ -40,13 +129,16 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration_ms = (time.perf_counter() - start) * 1000
     logger.info(
-        "%s %s -> %s %.1fms",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
+        "Request processed",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": round(duration_ms, 3),
+        },
     )
     return response
+
 
 # (IANA, подсказки для поиска — город или вариант написания)
 _ZONE_HINTS: list[tuple[str, tuple[str, ...]]] = [
@@ -130,7 +222,10 @@ def _parse_local_clock(time_str: str, from_tz: ZoneInfo) -> datetime:
 def get_server_time() -> dict[str, str]:
     """Текущее локальное время сервера в формате ISO 8601 (с часовым поясом)."""
     iso = datetime.now().astimezone().isoformat()
-    logger.info("эндпоинт /time: отдано server_time=%s", iso)
+    logger.info(
+        "эндпоинт /time: ответ с локальным временем",
+        extra={"endpoint": "/time", "server_time": iso},
+    )
     return {"server_time": iso}
 
 
@@ -138,7 +233,10 @@ def get_server_time() -> dict[str, str]:
 def get_server_date() -> dict[str, str]:
     """Текущая локальная дата сервера (ISO 8601: YYYY-MM-DD)."""
     d = datetime.now().astimezone().date().isoformat()
-    logger.info("эндпоинт /date: отдана server_date=%s", d)
+    logger.info(
+        "эндпоинт /date: ответ с локальной датой",
+        extra={"endpoint": "/date", "server_date": d},
+    )
     return {"server_date": d}
 
 
@@ -146,7 +244,10 @@ def get_server_date() -> dict[str, str]:
 def get_server_date_utc() -> dict[str, str]:
     """Текущая дата по UTC (ISO 8601: YYYY-MM-DD)."""
     d = datetime.now(timezone.utc).date().isoformat()
-    logger.info("эндпоинт /date/utc: отдана server_date_utc=%s", d)
+    logger.info(
+        "эндпоинт /date/utc: ответ с датой UTC",
+        extra={"endpoint": "/date/utc", "server_date_utc": d},
+    )
     return {"server_date_utc": d}
 
 
@@ -172,7 +273,11 @@ def list_time_cities() -> dict[str, list[dict[str, str]]]:
                 "examples": ", ".join(sorted(set(hints), key=str.lower)),
             }
         )
-    logger.info("эндпоинт /time/cities: отдано городов=%s", len(items))
+    n = len(items)
+    logger.info(
+        "эндпоинт /time/cities: отдан список городов",
+        extra={"endpoint": "/time/cities", "cities_count": n},
+    )
     return {"cities": items}
 
 
@@ -201,12 +306,16 @@ def convert_local_time_to_zone(
     there = instant.astimezone(to_tz)
 
     logger.info(
-        "эндпоинт /time/convert: время=%s от=%s (%s) в=%s (%s)",
-        time.strip(),
-        from_city.strip(),
-        from_iana,
-        to.strip(),
-        to_iana,
+        "эндпоинт /time/convert: конвертация времени",
+        extra={
+            "endpoint": "/time/convert",
+            "time_input": time.strip(),
+            "from_city": from_city.strip(),
+            "to_city": to.strip(),
+            "from_iana": from_iana,
+            "to_iana": to_iana,
+            "result_local_iso": there.isoformat(),
+        },
     )
     return {
         "your_input": time.strip(),
@@ -222,5 +331,8 @@ def convert_local_time_to_zone(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    logger.info("эндпоинт /health: ok")
+    logger.info(
+        "эндпоинт /health: ok",
+        extra={"endpoint": "/health", "health_status": "ok"},
+    )
     return {"status": "ok"}

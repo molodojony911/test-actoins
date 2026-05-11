@@ -1,4 +1,4 @@
-"""Настройка отправки логов в Grafana Loki (HTTP push API)."""
+"""Настройка отправки логов в Grafana Loki (HTTP push API) и JSON-форматирование."""
 
 from __future__ import annotations
 
@@ -6,12 +6,72 @@ import base64
 import json
 import logging
 import os
-import time
+from datetime import datetime, timezone
 from typing import Any
+
+from pythonjsonlogger.jsonlogger import JsonFormatter as BaseJsonFormatter
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 _LOKI_ATTACHED = False
+
+
+class StructuredJsonFormatter(BaseJsonFormatter):
+    """JSON-строка лога: timestamp, level, logger, message + поля из extra и exc_info."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            fmt="%(levelname)s %(name)s %(message)s",
+            json_ensure_ascii=False,
+            rename_fields={
+                "levelname": "level",
+                "name": "logger",
+            },
+            timestamp=False,
+        )
+
+    def add_fields(
+        self,
+        log_record: dict[str, Any],
+        record: logging.LogRecord,
+        message_dict: dict[str, Any],
+    ) -> None:
+        super().add_fields(log_record, record, message_dict)
+        log_record["timestamp"] = datetime.fromtimestamp(
+            record.created,
+            tz=timezone.utc,
+        ).isoformat(timespec="microseconds")
+        log_record["message"] = record.getMessage()
+        if record.exc_info:
+            log_record["exc_info"] = self.formatException(record.exc_info)
+
+
+def get_json_formatter() -> StructuredJsonFormatter:
+    return StructuredJsonFormatter()
+
+
+def loki_static_labels_from_env() -> dict[str, str]:
+    """Статические лейблы потока Loki из переменных окружения (как в setup_logging)."""
+    app_label = (os.environ.get("LOKI_APP_LABEL") or "").strip() or "test-gitact"
+    env_label = (os.environ.get("LOKI_ENV") or "").strip() or "production"
+    static_labels: dict[str, str] = {
+        "app": app_label,
+        "env": env_label,
+        "service": "fastapi",
+    }
+    extra = os.environ.get("LOKI_EXTRA_LABELS", "").strip()
+    if extra:
+        for part in extra.split(","):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                k, v = k.strip(), v.strip()
+                if k and v:
+                    static_labels[k] = v
+    return static_labels
+
+
+def _loki_resolve_push_url(url_or_base: str) -> str:
+    base = url_or_base.rstrip("/").removesuffix("/loki/api/v1/push")
+    return f"{base}/loki/api/v1/push"
 
 
 class LokiHandler(logging.Handler):
@@ -28,8 +88,7 @@ class LokiHandler(logging.Handler):
         timeout: float = 5.0,
     ) -> None:
         super().__init__()
-        base = push_url.rstrip("/").removesuffix("/loki/api/v1/push")
-        self.push_url = f"{base}/loki/api/v1/push"
+        self.push_url = _loki_resolve_push_url(push_url)
         self.static_labels = static_labels
         self.org_id = org_id
         self.basic_token: str | None = None
@@ -40,66 +99,48 @@ class LokiHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Ленивый импорт: main уже загружен к моменту первого лога.
+            from main import send_log_to_loki
+
             msg = self.format(record)
-            ts_ns = str(int(time.time() * 1_000_000_000))
+            ts_ns = int(record.created * 1_000_000_000)
             stream_labels = {**self.static_labels, "level": record.levelname.lower()}
-            payload: dict[str, Any] = {
-                "streams": [
-                    {
-                        "stream": stream_labels,
-                        "values": [[ts_ns, msg]],
-                    }
-                ]
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = Request(
-                self.push_url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            send_log_to_loki(
+                msg,
+                push_url=self.push_url,
+                stream_labels=stream_labels,
+                merge_with_defaults=False,
+                timestamp_ns=ts_ns,
+                org_id=self.org_id,
+                basic_token=self.basic_token,
+                timeout=self.timeout,
             )
-            if self.org_id:
-                req.add_header("X-Scope-OrgID", self.org_id)
-            if self.basic_token:
-                req.add_header("Authorization", f"Basic {self.basic_token}")
-            urlopen(req, timeout=self.timeout)
         except (OSError, URLError, ValueError):
             self.handleError(record)
 
 
 def setup_logging() -> None:
-    """Консоль для приложения; при LOKI_URL — ещё push в Loki (один раз)."""
+    """Консоль и Loki: один JSON-форматтер на строку лога."""
+    json_fmt = get_json_formatter()
+
     app_log = logging.getLogger("app")
     app_log.setLevel(logging.INFO)
     if not app_log.handlers:
         stream = logging.StreamHandler()
-        stream.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(message)s"),
-        )
+        stream.setFormatter(json_fmt)
         app_log.addHandler(stream)
+    else:
+        for h in app_log.handlers:
+            if isinstance(h, logging.StreamHandler):
+                h.setFormatter(json_fmt)
 
     global _LOKI_ATTACHED
-    # Пустая / только пробелы — как не задано: тот же default, что и при unset.
     url = (os.environ.get("LOKI_URL") or "").strip() or "http://loki:3100"
     if _LOKI_ATTACHED:
         return
     _LOKI_ATTACHED = True
 
-    app_label = (os.environ.get("LOKI_APP_LABEL") or "").strip() or "test-gitact"
-    env_label = (os.environ.get("LOKI_ENV") or "").strip() or "production"
-    static_labels = {
-        "app": app_label,
-        "env": env_label,
-        "service": "fastapi",
-    }
-    extra = os.environ.get("LOKI_EXTRA_LABELS", "").strip()
-    if extra:
-        for part in extra.split(","):
-            if "=" in part:
-                k, _, v = part.partition("=")
-                k, v = k.strip(), v.strip()
-                if k and v:
-                    static_labels[k] = v
+    static_labels = loki_static_labels_from_env()
 
     org_id = (os.environ.get("LOKI_ORG_ID") or "").strip() or None
     basic_user = (os.environ.get("LOKI_BASIC_AUTH_USER") or "").strip() or None
@@ -114,7 +155,7 @@ def setup_logging() -> None:
         timeout=float(os.environ.get("LOKI_TIMEOUT", "5")),
     )
     handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(json_fmt)
 
     for name in ("app", "uvicorn", "uvicorn.access", "uvicorn.error"):
         log = logging.getLogger(name)
