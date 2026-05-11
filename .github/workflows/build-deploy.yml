@@ -112,10 +112,15 @@ jobs:
             docker pull "${{ needs.build-and-push.outputs.image }}:latest"
             docker stop "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
             docker rm "${{ env.DEPLOY_CONTAINER_NAME }}" 2>/dev/null || true
+            # Если сеть не существует, docker run с --network падает целиком — контейнер не поднимается.
             NET_NAME="${{ vars.DEPLOY_DOCKER_NETWORK || env.DEPLOY_DOCKER_NETWORK }}"
             NET_ARG=""
             if [ -n "$NET_NAME" ]; then
-              NET_ARG="--network $NET_NAME"
+              if docker network inspect "$NET_NAME" >/dev/null 2>&1; then
+                NET_ARG="--network $NET_NAME"
+              else
+                echo "::warning::Сеть Docker «$NET_NAME» не найдена — запуск без --network (приложение доступно; Loki по имени хоста loki может быть недоступен). Создайте сеть: docker network create $NET_NAME"
+              fi
             fi
             docker run -d \
               --name "${{ env.DEPLOY_CONTAINER_NAME }}" \
