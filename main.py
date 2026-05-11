@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from logging_loki import setup_logging
 
@@ -18,6 +19,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Test Backend", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """4xx/5xx в Loki (logger app + uvicorn.error)."""
+    logger.warning(
+        "ошибка %s %s: статус=%s деталь=%s",
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.middleware("http")
@@ -115,19 +129,25 @@ def _parse_local_clock(time_str: str, from_tz: ZoneInfo) -> datetime:
 @app.get("/time")
 def get_server_time() -> dict[str, str]:
     """Текущее локальное время сервера в формате ISO 8601 (с часовым поясом)."""
-    return {"server_time": datetime.now().astimezone().isoformat()}
+    iso = datetime.now().astimezone().isoformat()
+    logger.info("эндпоинт /time: отдано server_time=%s", iso)
+    return {"server_time": iso}
 
 
 @app.get("/date")
 def get_server_date() -> dict[str, str]:
     """Текущая локальная дата сервера (ISO 8601: YYYY-MM-DD)."""
-    return {"server_date": datetime.now().astimezone().date().isoformat()}
+    d = datetime.now().astimezone().date().isoformat()
+    logger.info("эндпоинт /date: отдана server_date=%s", d)
+    return {"server_date": d}
 
 
 @app.get("/date/utc")
 def get_server_date_utc() -> dict[str, str]:
     """Текущая дата по UTC (ISO 8601: YYYY-MM-DD)."""
-    return {"server_date_utc": datetime.now(timezone.utc).date().isoformat()}
+    d = datetime.now(timezone.utc).date().isoformat()
+    logger.info("эндпоинт /date/utc: отдана server_date_utc=%s", d)
+    return {"server_date_utc": d}
 
 
 def _zone_label(hints: tuple[str, ...]) -> str:
@@ -152,6 +172,7 @@ def list_time_cities() -> dict[str, list[dict[str, str]]]:
                 "examples": ", ".join(sorted(set(hints), key=str.lower)),
             }
         )
+    logger.info("эндпоинт /time/cities: отдано городов=%s", len(items))
     return {"cities": items}
 
 
@@ -179,6 +200,14 @@ def convert_local_time_to_zone(
     instant = _parse_local_clock(time, from_tz)
     there = instant.astimezone(to_tz)
 
+    logger.info(
+        "эндпоинт /time/convert: время=%s от=%s (%s) в=%s (%s)",
+        time.strip(),
+        from_city.strip(),
+        from_iana,
+        to.strip(),
+        to_iana,
+    )
     return {
         "your_input": time.strip(),
         "your_city_or_zone": from_city.strip(),
@@ -193,4 +222,5 @@ def convert_local_time_to_zone(
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    logger.info("эндпоинт /health: ok")
     return {"status": "ok"}
